@@ -1,169 +1,91 @@
 import streamlit as st
-import pypdfium2 as pdfium
+import pdfplumber
 import numpy as np
 from PIL import Image
 import io
-import tempfile
 
-# ---------------- Налаштування сторінки ----------------
-st.set_page_config(page_title="Clean PDF Collage", page_icon="📄", layout="centered")
+# Конфігурація сторінки
+st.set_page_config(page_title="Clean PDF", page_icon="📄", layout="centered")
+st.title("📄 Clean PDF — автоматичне очищення PDF для друку")
 
-st.title("📄 Clean PDF — обрізання полів + колаж на A4")
-st.write(
-    "Завантаж PDF — я обріжу білі поля, масштабую вміст по ширині сторінки "
-    "і складу кілька блоків один під одним на аркушах A4."
-)
+uploaded = st.file_uploader("Завантаж PDF", type=["pdf"])
 
-uploaded_file = st.file_uploader("Завантаж PDF-файл", type=["pdf"])
+# Константи
+CM_TO_PX = 118   # 1 см = 118 px при 300 dpi
+MARGIN = int(1.0 * CM_TO_PX)
+SPACING = int(0.8 * CM_TO_PX)
 
-# ---------------- Налаштування колажу ----------------
-# Працюємо в ландшафтній орієнтації, як у твоєму локальному скрипті
-A4_WIDTH = 3508   # px при 300 dpi (≈297 мм)
-A4_HEIGHT = 2480  # px при 300 dpi (≈210 мм)
-
-# 1 см ≈ 118 px (300 dpi ≈ 118 пікселів на см)
-CM_TO_PX = 118
-MARGIN_CM = 1.0
-SPACING_CM = 0.8  # відстань між блоками
-
-MARGIN = int(MARGIN_CM * CM_TO_PX)    # поля з усіх боків ~1 см
-SPACING = int(SPACING_CM * CM_TO_PX)  # вертикальний інтервал між секціями
+# A4 — вертикально
+A4_WIDTH, A4_HEIGHT = 2480, 3508
 
 
-def crop_whitespace(np_img: np.ndarray, threshold: int = 245) -> np.ndarray:
-    """
-    Обрізає білі поля навколо контенту.
-    threshold — поріг «білизни»: чим менший, тим агресивніше обрізання.
-    """
-    # Переводимо в відтінки сірого
-    if np_img.ndim == 3:
-        gray = np.mean(np_img, axis=2)
-    else:
-        gray = np_img
+# ✂️ Обрізання білих полів
+def crop_white(img: Image.Image):
+    gray = img.convert("L")
+    arr = np.array(gray)
 
-    # де пікселі НЕ білі
-    mask = gray < threshold
-
-    if not mask.any():
-        # Якщо взагалі нічого не знайшли (порожня сторінка) — повертаємо як є
-        return np_img
-
+    mask = arr < 240  # темні / не-білі пікселі
     coords = np.argwhere(mask)
+
+    if coords.size == 0:
+        return img
+
     y0, x0 = coords.min(axis=0)
-    y1, x1 = coords.max(axis=0) + 1  # +1, щоб включити останній піксель
-
-    cropped = np_img[y0:y1, x0:x1]
-    return cropped
+    y1, x1 = coords.max(axis=0) + 1
+    return img.crop((x0, y0, x1, y1))
 
 
-def make_collage_pages(images_np):
-    """
-    Приймає список кропнутих np-масивів (H, W, 3),
-    складає їх по висоті на аркушах A4 з полями і відступами.
-    Повертає список PIL.Image сторінок.
-    """
-    pages = []
+# ➕ Додаємо сторінку у PDF (через Pillow)
+def save_page_to_pdf(canvas, pdf_list):
+    buf = io.BytesIO()
+    canvas.save(buf, format="PDF")
+    pdf_list.append(buf.getvalue())
 
-    # Поточний "аркуш" як біле тло
-    canvas = np.ones((A4_HEIGHT, A4_WIDTH, 3), dtype=np.uint8) * 255
+
+if uploaded:
+    st.info("⌛ Обробка PDF, зачекай кілька секунд...")
+
+    pdf_pages = []
+    fragments = []
+
+    # 🟦 1. Вичитуємо PDF і конвертуємо кожну сторінку в картинку
+    with pdfplumber.open(uploaded) as pdf:
+        for page in pdf.pages:
+            img = page.to_image(resolution=300).original
+            pil_img = Image.fromarray(img)
+
+            cropped = crop_white(pil_img)
+            fragments.append(cropped)
+
+    # 🟦 2. Створюємо чистий аркуш
+    canvas = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
     y_cursor = MARGIN
-    has_content = False  # чи щось уже намальовано на поточному аркуші
 
-    max_width = A4_WIDTH - 2 * MARGIN
+    # 🟦 3. Розкладка блоків по листу
+    for block in fragments:
+        max_width = A4_WIDTH - 2 * MARGIN
+        ratio = max_width / block.width
 
-    for np_img in images_np:
-        h, w = np_img.shape[:2]
+        resized = block.resize((max_width, int(block.height * ratio)))
 
-        # Масштабуємо під ширину (з урахуванням полів)
-        scale = max_width / w
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-
-        pil_img = Image.fromarray(np_img)
-        pil_resized = pil_img.resize((new_w, new_h), Image.LANCZOS)
-        np_resized = np.array(pil_resized)
-
-        h2, w2 = np_resized.shape[:2]
-
-        # Якщо не влазить по висоті — створюємо нову сторінку
-        if y_cursor + h2 + MARGIN > A4_HEIGHT:
-            # додаємо попередній заповнений аркуш
-            if has_content:
-                pages.append(Image.fromarray(canvas))
-
-            # новий чистий аркуш
-            canvas = np.ones((A4_HEIGHT, A4_WIDTH, 3), dtype=np.uint8) * 255
+        if y_cursor + resized.height + MARGIN > A4_HEIGHT:
+            save_page_to_pdf(canvas, pdf_pages)
+            canvas = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
             y_cursor = MARGIN
-            has_content = False
 
-        # Вставляємо блок зліва, із заданим відступом
-        x_pos = MARGIN
-        canvas[y_cursor:y_cursor + h2, x_pos:x_pos + w2] = np_resized
-        y_cursor += h2 + SPACING
-        has_content = True
+        canvas.paste(resized, (MARGIN, y_cursor))
+        y_cursor += resized.height + SPACING
 
-    # Додаємо останній аркуш, якщо там щось є
-    if has_content:
-        pages.append(Image.fromarray(canvas))
+    save_page_to_pdf(canvas, pdf_pages)
 
-    return pages
+    # 🟦 4. Об'єднуємо PDF-сторінки
+    final_pdf = b"".join(pdf_pages)
 
-
-if uploaded_file is not None:
-    st.info(f"Файл: **{uploaded_file.name}**")
-
-    if st.button("✨ Обробити PDF (обрізати поля + колаж)"):
-        try:
-            # Тимчасово записуємо PDF для pdfium
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded_file.read())
-                input_path = tmp.name
-
-            # Відкриваємо PDF через pypdfium2
-            pdf = pdfium.PdfDocument(input_path)
-            processed_images = []
-
-            # Рендеримо сторінки в зображення та обрізаємо поля
-            for i in range(len(pdf)):
-                page = pdf[i]
-                # scale 2.0 — нормальна якість без гігантського розміру
-                bitmap = page.render(scale=2.0)
-                pil_img = bitmap.to_pil()
-                np_img = np.array(pil_img)
-
-                # Обрізаємо білі поля
-                cropped = crop_whitespace(np_img)
-                processed_images.append(cropped)
-
-            # Робимо колажні сторінки
-            collage_pages = make_collage_pages(processed_images)
-
-            if not collage_pages:
-                st.error("Не вдалося створити жодної сторінки. Можливо, PDF порожній?")
-            else:
-                # Записуємо у PDF в пам'ять
-                pdf_bytes = io.BytesIO()
-                first_page = collage_pages[0]
-                if len(collage_pages) == 1:
-                    first_page.save(pdf_bytes, format="PDF")
-                else:
-                    first_page.save(
-                        pdf_bytes,
-                        format="PDF",
-                        save_all=True,
-                        append_images=collage_pages[1:],
-                    )
-                pdf_bytes.seek(0)
-
-                st.success("✅ Готово! Створено новий PDF з обрізаними полями і колажем.")
-                st.download_button(
-                    "⬇️ Завантажити оброблений PDF",
-                    data=pdf_bytes,
-                    file_name="optimized_collage.pdf",
-                    mime="application/pdf",
-                )
-
-        except Exception as e:
-            st.error(f"❌ Помилка під час обробки PDF: {e}")
-else:
-    st.write("⬆️ Завантаж PDF-файл, щоб почати.")
+    # 🟦 5. Даємо кнопку на завантаження
+    st.success("Готово! Завантажуй оптимізований PDF 👇")
+    st.download_button(
+        "⬇️ Завантажити PDF",
+        final_pdf,
+        file_name="optimized_for_print.pdf",
+        mime="application/pdf",
+    )
