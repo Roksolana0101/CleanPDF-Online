@@ -1,91 +1,104 @@
 import streamlit as st
-import pdfplumber
+import fitz
+import cv2
 import numpy as np
+import tempfile
 from PIL import Image
-import io
 
-# Конфігурація сторінки
 st.set_page_config(page_title="Clean PDF", page_icon="📄", layout="centered")
-st.title("📄 Clean PDF — автоматичне очищення PDF для друку")
+
+st.title("📄 Clean PDF — оптимізатор PDF для друку")
+st.write("Завантаж PDF — я автоматично обріжу поля, вирівняю текст і створю чистий файл для друку.")
 
 uploaded = st.file_uploader("Завантаж PDF", type=["pdf"])
 
-# Константи
-CM_TO_PX = 118   # 1 см = 118 px при 300 dpi
-MARGIN = int(1.0 * CM_TO_PX)
-SPACING = int(0.8 * CM_TO_PX)
-
-# A4 — вертикально
-A4_WIDTH, A4_HEIGHT = 2480, 3508
-
-
-# ✂️ Обрізання білих полів
-def crop_white(img: Image.Image):
-    gray = img.convert("L")
-    arr = np.array(gray)
-
-    mask = arr < 240  # темні / не-білі пікселі
-    coords = np.argwhere(mask)
-
-    if coords.size == 0:
-        return img
-
-    y0, x0 = coords.min(axis=0)
-    y1, x1 = coords.max(axis=0) + 1
-    return img.crop((x0, y0, x1, y1))
-
-
-# ➕ Додаємо сторінку у PDF (через Pillow)
-def save_page_to_pdf(canvas, pdf_list):
-    buf = io.BytesIO()
-    canvas.save(buf, format="PDF")
-    pdf_list.append(buf.getvalue())
-
-
 if uploaded:
-    st.info("⌛ Обробка PDF, зачекай кілька секунд...")
+    # тимчасовий файл
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp:
+        temp.write(uploaded.read())
+        input_path = temp.name
 
-    pdf_pages = []
-    fragments = []
+    OUTPUT_FILE = "optimized_for_print.pdf"
 
-    # 🟦 1. Вичитуємо PDF і конвертуємо кожну сторінку в картинку
-    with pdfplumber.open(uploaded) as pdf:
-        for page in pdf.pages:
-            img = page.to_image(resolution=300).original
-            pil_img = Image.fromarray(img)
+    CM_TO_PT = 28.35
+    MARGIN = int(CM_TO_PT * 1.0)
+    SPACING = int(CM_TO_PT * 0.8)
 
-            cropped = crop_white(pil_img)
-            fragments.append(cropped)
+    # A4 у високій якості
+    A4_WIDTH, A4_HEIGHT = 3508, 2480
 
-    # 🟦 2. Створюємо чистий аркуш
-    canvas = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
+    # 1️⃣ Читаємо PDF
+    doc = fitz.open(input_path)
+    processed = []
+
+    for i in range(len(doc)):
+        pix = doc[i].get_pixmap(matrix=fitz.Matrix(3, 3))
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+
+        # конвертація RGBA → RGB
+        if img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+
+        # обрізання полів
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        _, mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            x, y, w, h = cv2.boundingRect(np.vstack(contours))
+            cropped = img[y:y+h, x:x+w]
+        else:
+            cropped = img
+
+        processed.append(cropped)
+
+    doc.close()
+
+    # 2️⃣ Формуємо вихідний PDF
+    output = fitz.open()
+    page_canvas = np.ones((A4_HEIGHT, A4_WIDTH, 3), dtype=np.uint8) * 255
     y_cursor = MARGIN
 
-    # 🟦 3. Розкладка блоків по листу
-    for block in fragments:
+    def add_page_to_pdf(canvas):
+        """Вставляє зібрану сторінку у PDF файл"""
+        pil_img = Image.fromarray(canvas.astype(np.uint8))
+        img_bytes = pil_img.tobytes("raw", "RGB")
+
+        page = output.new_page(width=pil_img.width, height=pil_img.height)
+        page.insert_image(
+            fitz.Rect(0, 0, pil_img.width, pil_img.height),
+            stream=pil_img.tobytes(),
+            keep_proportion=False
+        )
+
+    # 3️⃣ Розміщення блоків на аркуші
+    for img in processed:
         max_width = A4_WIDTH - 2 * MARGIN
-        ratio = max_width / block.width
+        scale = max_width / img.shape[1]
+        img = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)))
 
-        resized = block.resize((max_width, int(block.height * ratio)))
+        h, w, _ = img.shape
 
-        if y_cursor + resized.height + MARGIN > A4_HEIGHT:
-            save_page_to_pdf(canvas, pdf_pages)
-            canvas = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
+        # новий аркуш, якщо не влазить
+        if y_cursor + h + MARGIN > A4_HEIGHT:
+            add_page_to_pdf(page_canvas)
+            page_canvas = np.ones((A4_HEIGHT, A4_WIDTH, 3), dtype=np.uint8) * 255
             y_cursor = MARGIN
 
-        canvas.paste(resized, (MARGIN, y_cursor))
-        y_cursor += resized.height + SPACING
+        page_canvas[y_cursor:y_cursor+h, MARGIN:MARGIN+w] = img
+        y_cursor += h + SPACING
 
-    save_page_to_pdf(canvas, pdf_pages)
+    # додаємо фінальний аркуш
+    add_page_to_pdf(page_canvas)
 
-    # 🟦 4. Об'єднуємо PDF-сторінки
-    final_pdf = b"".join(pdf_pages)
+    output.save(OUTPUT_FILE)
+    output.close()
 
-    # 🟦 5. Даємо кнопку на завантаження
-    st.success("Готово! Завантажуй оптимізований PDF 👇")
-    st.download_button(
-        "⬇️ Завантажити PDF",
-        final_pdf,
-        file_name="optimized_for_print.pdf",
-        mime="application/pdf",
-    )
+    # кнопка завантажити
+    with open(OUTPUT_FILE, "rb") as f:
+        st.download_button(
+            "⬇️ Завантажити оптимізований PDF",
+            f,
+            file_name=OUTPUT_FILE,
+            mime="application/pdf"
+        )
