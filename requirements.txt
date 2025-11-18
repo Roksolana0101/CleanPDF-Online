@@ -1,4 +1,4 @@
 streamlit
-pypdfium2
+pdfplumber
+pillow
 numpy
-Pillow
