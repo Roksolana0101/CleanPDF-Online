@@ -1,4 +1,5 @@
 streamlit
-pdf2image
+pypdfium2
 opencv-python-headless
 Pillow
+numpy
