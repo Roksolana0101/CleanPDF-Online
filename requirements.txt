@@ -1,4 +1,4 @@
 streamlit
-pdfplumber
-pillow
-numpy
+pdf2image
+opencv-python-headless
+Pillow
