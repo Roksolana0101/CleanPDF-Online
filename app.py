@@ -69,8 +69,11 @@ if uploaded:
                 y = MARGIN
 
             # Вставка на сторінку
-            current[y:y+new_h, MARGIN:MARGIN+new_w] = resized
-            y += new_h + SPACING
+insert_h = min(new_h, current.shape[0] - y)
+insert_w = min(new_w, current.shape[1] - MARGIN)
+
+current[y:y+insert_h, MARGIN:MARGIN+insert_w] = resized[:insert_h, :insert_w]
+y += insert_h + SPACING
 
         # Додати останню сторінку
         a4_pages.append(Image.fromarray(current))
